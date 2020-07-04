@@ -42,7 +42,7 @@ also can't cross-assign, cross-create or cross-compare.
 To access more functionality, you add modifiers. For example:
 
 ```Cpp
-using ordered_int = strong::type<int, ordered_int_, strong::ordered>;
+using ordered_int = strong::type<int, struct ordered_int_, strong::ordered>;
 ```
 
 Type `ordered_int` now supports relational order comparisons, like `<`,

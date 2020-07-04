@@ -4,300 +4,170 @@
 #include <utility>
 #include <type_traits>
 #include <functional>
-
-#if __cplusplus >= 201703L
-#define STRONG_NODISCARD [[nodiscard]]
-#else
-#define STRONG_NODISCARD
-#endif
+#include <concepts>
+#include <iosfwd>
 
 namespace strong
 {
 
-namespace impl
-{
-  template <typename T, typename ... V>
-  using WhenConstructible = std::enable_if_t<std::is_constructible<T, V...>::value>;
-}
-
 template <typename M, typename T>
 using modifier = typename M::template modifier<T>;
+
+template <typename T, typename Tag, typename ... Ms>
+class type;
 
 struct default_constructible
 {
   template <typename T>
-  class modifier
+  class modifier;
+
+  template <typename T, typename Tag, typename ... Ms>
+  requires(std::is_default_constructible_v<T>)
+  class modifier<type<T, Tag, Ms...>>
   {
   };
 };
 
 namespace impl {
-  template <typename T>
-  constexpr bool supports_default_construction(const ::strong::default_constructible::modifier<T>*)
-  {
-    return true;
-  }
+  template<typename T>
+  constexpr bool
+  is_default_constructible_test(const typename default_constructible::template modifier<T> *) { return true; }
+
+  constexpr bool is_default_constructible_test(...) { return false; }
+
+  template<typename T>
+  inline constexpr bool is_default_constructible =
+    impl::is_default_constructible_test((const T *) nullptr);
 }
+
+struct uninitialized_t {};
+inline constexpr uninitialized_t uninitialized{};
 
 template <typename T, typename Tag, typename ... M>
 class type : public modifier<M, type<T, Tag, M...>>...
 {
 public:
-  template <typename type_ = type,
-            bool = impl::supports_default_construction(static_cast<type_*>(nullptr))>
   constexpr
   type()
-    noexcept(noexcept(T{}))
+    noexcept(std::is_nothrow_default_constructible_v<T>)
+    requires (std::is_default_constructible_v<T> &&
+      impl::is_default_constructible<type>)
   : val{}
   {
   }
 
-  template <typename U,
-    typename = impl::WhenConstructible<T, std::initializer_list<U>>>
+  explicit
+  type(uninitialized_t)
+    noexcept
+  requires(std::is_trivially_constructible_v<T>)
+  {
+  }
+  template <typename U>
   constexpr
   explicit
   type(
     std::initializer_list<U> us
   )
     noexcept(noexcept(T{us}))
+    requires(std::is_constructible_v<T, std::initializer_list<U>>)
   : val{us}
   {
   }
-  template <typename ... U,
-            typename = std::enable_if_t<std::is_constructible<T, U&&...>::value && (sizeof...(U) > 0)>>
+  template <typename ... U>
   constexpr
   explicit
   type(
     U&& ... u)
   noexcept(std::is_nothrow_constructible<T, U...>::value)
+  requires(std::is_constructible_v<T, U...> && sizeof...(U) > 0)
   : val(std::forward<U>(u)...)
   {}
+
 
   friend void swap(type& a, type& b) noexcept(
                                         std::is_nothrow_move_constructible<type>::value &&
                                         std::is_nothrow_move_assignable<type>::value
                                       )
+  requires(std::swappable<T>)
   {
     using std::swap;
     swap(a.val, b.val);
   }
 
-  STRONG_NODISCARD
-  constexpr T& value_of() & noexcept { return val;}
-  STRONG_NODISCARD
-  constexpr const T& value_of() const & noexcept { return val;}
-  STRONG_NODISCARD
-  constexpr T&& value_of() && noexcept { return std::move(val);}
+  friend constexpr T& value_of(type& p) noexcept { return p.val;}
+  friend constexpr T&& value_of(type&& p) noexcept { return std::move(p).val;}
+  friend constexpr const T& value_of(const type& p) noexcept { return p.val;}
+  friend constexpr const T&& value_of(const type&& p) noexcept { return std::move(p).val;}
+
 private:
   T val;
 };
+template <typename T>
+T underlying_type_func(T);
+template <typename T, typename Tag, typename ... Ms>
+T underlying_type_func(type<T, Tag, Ms...>);
 
 template <typename T>
-struct is_safe_type : std::false_type {};
-template <typename T, typename Tag, typename ... M>
-struct is_safe_type<type<T, Tag, M...>> : std::true_type {};
+using underlying_type_t = decltype(underlying_type_func(std::declval<T>()));
 
 namespace impl {
+  template <typename ... Ts>
+  constexpr bool is_strong_type_func(const strong::type<Ts...>*) { return true;}
+  constexpr bool is_strong_type_func(...) { return false;}
   template <typename T>
-  using WhenSafeType = std::enable_if_t<is_safe_type<std::decay_t<T>>::value>;
+  concept strong_type = is_strong_type_func(static_cast<std::remove_cvref_t<T>*>(nullptr));
+
   template <typename T>
-  using WhenNotSafeType = std::enable_if_t<!is_safe_type<std::decay_t<T>>::value>;
+  constexpr auto&& access(T&& t)
+  {
+    if constexpr (strong_type<T>)
+    {
+      return value_of(std::forward<T>(t));
+    }
+    else
+      return std::forward<T>(t);
+  }
+
+#if 0
+  template<strong_type T>
+  constexpr auto&& access(T&& t)
+  {
+    return value_of(std::forward<T>(t));
+  }
+  template <typename T>
+  constexpr auto&& access(T&& t) requires (!strong_type<T>) { return std::forward<T>(t);}
+#endif
 }
-
-template <typename T>
-struct underlying_type
-{
-  using type = T;
-};
-
-template <typename T, typename Tag, typename ... M>
-struct underlying_type<type<T, Tag, M...>>
-{
-  using type = T;
-};
-
-template <typename T>
-using underlying_type_t = typename underlying_type<T>::type;
-
-template <
-  typename T,
-  typename = impl::WhenSafeType<T>>
-STRONG_NODISCARD
-constexpr
-auto
-value_of(T&& t)
-noexcept
--> decltype(std::forward<T>(t).value_of())
-{
-  return std::forward<T>(t).value_of();
-}
-
-template <
-  typename T,
-  typename = impl::WhenNotSafeType<T>>
-constexpr
-T&&
-value_of(T&& t)
-noexcept
-{
-  return std::forward<T>(t);
-}
-
-namespace impl
-{
-template <typename T, typename U>
-static constexpr T &get(U &u) noexcept
-{
-  static_assert(is_safe_type<T>::value, "");
-  static_assert(std::is_base_of<U, T>::value, "");
-  return static_cast<T &>(u);
-}
-
-template <typename T, typename U>
-inline constexpr const T &get(const U &u) noexcept
-{
-  static_assert(is_safe_type<T>::value, "");
-  static_assert(std::is_base_of<U, T>::value, "");
-  return static_cast<const T &>(u);
-}
-
-template <typename T, typename U>
-inline constexpr T &&get(U &&u) noexcept
-{
-  static_assert(is_safe_type<T>::value, "");
-  static_assert(std::is_base_of<std::remove_reference_t<U>, T>::value, "");
-  return static_cast<T &&>(static_cast<U&&>(u));
-}
-
-template <typename T, typename U>
-inline constexpr decltype(auto) access(U &&t) noexcept
-{
-  static_assert(is_safe_type<T>::value, "");
-  static_assert(std::is_base_of<std::remove_reference_t<U>, T>::value, "");
-  return get<T>(std::forward<U>(t)).value_of();
-}
-
-template <typename T>
-struct type_of;
-
-template <typename T, typename Tag, typename ... M>
-struct type_of<::strong::type<T, Tag, M...>>
-{
-  using type = T;
-};
-
-template <typename T, typename Tag, typename ... M>
-struct type_of<::strong::type<T, Tag, M...> &>
-{
-  using type = T &;
-};
-
-template <typename T, typename Tag, typename ... M>
-struct type_of<::strong::type<T, Tag, M...> &&>
-{
-  using type = T &&;
-};
-
-template <typename T, typename Tag, typename ... M>
-struct type_of<const ::strong::type<T, Tag, M...> &>
-{
-  using type = const T &;
-};
-
-template <typename T>
-typename type_of<T>::type type_of_t();
-}
-
 struct equality
-{
-  template <typename T>
-  class modifier;
-};
-
-
-template <typename T, typename Tag, typename ... M>
-class equality::modifier<::strong::type<T, Tag, M...>>
-{
-  using type = ::strong::type<T, Tag, M...>;
-public:
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator==(
-    const modifier& lh,
-    const modifier& rh)
-  noexcept(noexcept(std::declval<const T&>() == std::declval<const T&>()))
-  -> decltype(std::declval<const T&>() == std::declval<const T&>())
-  {
-    return impl::access<type>(lh) == impl::access<type>(rh);
-  }
-
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator!=(
-    const modifier& lh,
-    const modifier& rh)
-  noexcept(noexcept(std::declval<const T&>() != std::declval<const T&>()))
-  -> decltype(std::declval<const T&>() != std::declval<const T&>())
-  {
-    return impl::access<type>(lh) != impl::access<type>(rh);
-  }
-};
-
-namespace impl
-{
-  template <typename T>
-  struct require_copy_constructible
-  {
-    static constexpr bool value = std::is_copy_constructible<underlying_type_t<T>>::value;
-    static_assert(value, "underlying type must be copy constructible");
-  };
-  template <typename T>
-  struct require_move_constructible
-  {
-    static constexpr bool value = std::is_move_constructible<underlying_type_t<T>>::value;
-    static_assert(value, "underlying type must be move constructible");
-  };
-  template <typename T>
-  struct require_copy_assignable
-  {
-    static constexpr bool value = std::is_copy_assignable<underlying_type_t<T>>::value;
-    static_assert(value, "underlying type must be copy assignable");
-  };
-  template <typename T>
-  struct require_move_assignable
-  {
-    static constexpr bool value = std::is_move_assignable<underlying_type_t<T>>::value;
-    static_assert(value, "underlying type must be move assignable");
-  };
-
-  template <bool> struct valid_type;
-  template <>
-  struct valid_type<true> {};
-
-  template <typename T>
-  struct require_semiregular
-    : valid_type<require_copy_constructible<T>::value &&
-                 require_move_constructible<T>::value &&
-                 require_copy_assignable<T>::value &&
-                 require_move_assignable<T>::value>
-  {
-  };
-
-}
-struct semiregular
 {
   template <typename>
   class modifier;
+  template <typename T, typename Tag, typename ... Ms>
+  class modifier<::strong::type<T, Tag, Ms...>>
+  {
+    using type = ::strong::type<T, Tag, Ms...>;
+    friend constexpr bool operator==(const type& lh, const type& rh)
+    noexcept(noexcept(value_of(lh) == value_of(rh)))
+    {
+      return value_of(lh) == value_of(rh);
+    }
+  };
 };
 
-template <typename T, typename Tag, typename ... M>
-class semiregular::modifier<::strong::type<T, Tag, M...>>
-  : public default_constructible::modifier<T>
-  , private impl::require_semiregular<T>
+
+
+
+struct semiregular
+{
+  template <typename>
+  struct modifier;
+};
+
+template <typename T>
+struct semiregular::modifier{};
+template <std::semiregular T, typename Tag, typename ... M>
+struct semiregular::modifier<::strong::type<T, Tag, M...>>
+  : public default_constructible::modifier<::strong::type<T, Tag, M...>>
 {
 };
 
@@ -317,63 +187,36 @@ struct ordered
   class modifier;
 };
 
-
-template <typename T, typename Tag, typename ... M>
+template <std::totally_ordered T, typename Tag, typename ... M>
 class ordered::modifier<::strong::type<T, Tag, M...>>
 {
   using type = ::strong::type<T, Tag, M...>;
 public:
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator<(
-    const modifier& lh,
-    const modifier& rh)
-  noexcept(noexcept(std::declval<const T&>() < std::declval<const T&>()))
+  [[nodiscard]] friend constexpr auto operator<(const type& lh, const type& rh)
+  noexcept(noexcept(value_of(lh) < value_of(rh)))
   -> decltype(std::declval<const T&>() < std::declval<const T&>())
   {
-    return impl::access<type>(lh) < impl::access<type>(rh);
+    return value_of(lh) < value_of(rh);
   }
-
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator<=(
-    const modifier& lh,
-    const modifier& rh)
-  noexcept(noexcept(std::declval<const T&>() <= std::declval<const T&>()))
+  [[nodiscard]] friend constexpr auto operator<=(const type& lh, const type& rh)
+  noexcept(noexcept(value_of(lh) <= value_of(rh)))
   -> decltype(std::declval<const T&>() <= std::declval<const T&>())
   {
-    return impl::access<type>(lh) <= impl::access<type>(rh);
+    return value_of(lh) <= value_of(rh);
   }
-
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator>(
-    const modifier& lh,
-    const modifier& rh)
-  noexcept(noexcept(std::declval<const T&>() > std::declval<const T&>()))
+  [[nodiscard]] friend constexpr auto operator>(const type& lh, const type& rh)
+  noexcept(noexcept(value_of(lh) > value_of(rh)))
   -> decltype(std::declval<const T&>() > std::declval<const T&>())
   {
-    return impl::access<type>(lh) > impl::access<type>(rh);
+    return value_of(lh) > value_of(rh);
   }
-
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator>=(
-    const modifier& lh,
-    const modifier& rh)
-  noexcept(noexcept(std::declval<const T&>() >= std::declval<const T&>()))
+  [[nodiscard]] friend constexpr auto operator>=(const type& lh, const type& rh)
+  noexcept(noexcept(value_of(lh) >= value_of(rh)))
   -> decltype(std::declval<const T&>() >= std::declval<const T&>())
   {
-    return impl::access<type>(lh) >= impl::access<type>(rh);
+    return value_of(lh) >= value_of(rh);
   }
+
 };
 
 struct ostreamable
@@ -386,9 +229,9 @@ struct ostreamable
     std::ostream&
     operator<<(
       std::ostream &os,
-      const modifier &t)
+      const T& t)
     {
-      return os << impl::access<T>(t);
+      return os << value_of(t);
     }
   };
 };
@@ -403,9 +246,9 @@ struct istreamable
     std::istream&
     operator>>(
       std::istream &is,
-      modifier &t)
+      T &t)
     {
-      return is >> impl::access<T>(t);
+      return is >> value_of(t);
     }
   };
 };
@@ -429,9 +272,9 @@ struct incrementable
     constexpr
     T&
     operator++()
-    noexcept(noexcept(++std::declval<T&>().value_of()))
+    noexcept(noexcept(++value_of(std::declval<T&>())))
     {
-      auto &self = impl::get<T>(*this);
+      auto &self = static_cast<T&>(*this);
       ++value_of(self);
       return self;
     }
@@ -440,7 +283,7 @@ struct incrementable
     T
     operator++(int)
     {
-      T rv{impl::get<T>(*this)};
+      auto rv{static_cast<T&>(*this)};
       ++*this;
       return rv;
     }
@@ -456,9 +299,9 @@ struct decrementable
     constexpr
     T&
     operator--()
-    noexcept(noexcept(--std::declval<T&>().value_of()))
+    noexcept(noexcept(--value_of(std::declval<T&>())))
     {
-      auto &self = impl::get<T>(*this);
+      auto &self = static_cast<T&>(*this);
       --value_of(self);
       return self;
     }
@@ -467,7 +310,7 @@ struct decrementable
     T
     operator--(int)
     {
-      T rv{impl::get<T>(*this)};
+      T rv{static_cast<T&>(*this)};
       --*this;
       return rv;
     }
@@ -491,9 +334,10 @@ struct boolean
   {
   public:
     explicit constexpr operator bool() const
-    noexcept(noexcept(static_cast<bool>(impl::type_of_t<T>())))
+    noexcept(noexcept(static_cast<bool>(value_of(std::declval<const T&>()))))
     {
-      return static_cast<bool>(impl::access<T>(*this));
+      const auto& self = static_cast<const T&>(*this);
+      return static_cast<bool>(value_of(self));
     }
   };
 };
@@ -519,29 +363,33 @@ public:
   type& operator+=(const type& t)
   noexcept(noexcept(std::declval<T&>() += value_of(t)))
   {
-    impl::access<type>(*this) += value_of(t);
-    return impl::get<type>(*this);
+    auto& self = static_cast<type&>(*this);
+    value_of(self) += value_of(t);
+    return self;
   }
 
   type& operator-=(const type& t)
     noexcept(noexcept(std::declval<T&>() -= value_of(t)))
   {
-    impl::access<type>(*this) -= value_of(t);
-    return impl::get<type>(*this);
+    auto& self = static_cast<type&>(*this);
+    value_of(self) -= value_of(t);
+    return self;
   }
 
   type& operator*=(const T& t)
   noexcept(noexcept(std::declval<T&>() *= t))
   {
-    impl::access<type>(*this) *= t;
-    return impl::get<type>(*this);
+    auto& self = static_cast<type&>(*this);
+    value_of(self) *= t;
+    return self;
   }
 
   type& operator/=(const T& t)
     noexcept(noexcept(std::declval<T&>() /= t))
   {
-    impl::access<type>(*this) /= t;
-    return impl::get<type>(*this);
+    auto& self = static_cast<type&>(*this);
+    value_of(self) /= t;
+    return self;
   }
 
   friend
@@ -586,6 +434,16 @@ public:
   }
 };
 
+
+namespace impl
+{
+  template <typename T>
+  concept subtractable = std::invocable<std::minus<>, const T&, const T&>;
+
+  template <typename T>
+  using diff_type = decltype(std::declval<const T&>() - std::declval<const T&>());
+}
+
 template <typename D>
 struct affine_point
 {
@@ -593,38 +451,26 @@ struct affine_point
   class modifier;
 };
 
-namespace impl
-{
-  template <typename ...>
-  using void_t = void;
-
-  template <typename T, typename = void>
-  struct subtractable : std::false_type {};
-
-  template <typename T>
-  struct subtractable<T, void_t<decltype(std::declval<const T&>() - std::declval<const T&>())>>
-  : std::true_type {};
-}
-
+template <typename D> template <typename>
+class affine_point<D>::modifier {};
 
 template <typename D>
 template <typename T, typename Tag, typename ... M>
+requires(std::constructible_from<D, impl::diff_type<T>>)
 class affine_point<D>::modifier<::strong::type<T, Tag, M...>>
 {
   using type = ::strong::type<T, Tag, M...>;
-  static_assert(impl::subtractable<T>::value, "it must be possible to subtract instances of your underlying type");
   using diff_type = decltype(std::declval<const T&>() - std::declval<const T&>());
-  static_assert(std::is_constructible<D, diff_type>::value,"");
 public:
-  STRONG_NODISCARD
+  [[nodiscard]]
   friend
   constexpr
   D
   operator-(
-    const modifier& lh,
-    const modifier& rh)
+    const type& lh,
+    const type& rh)
   {
-    return D(impl::access<type>(lh) - impl::access<type>(rh));
+    return D(value_of(lh) - value_of(rh));
   }
 
   type&
@@ -632,8 +478,9 @@ public:
     const D& d)
   noexcept(noexcept(std::declval<T&>() += value_of(d)))
   {
-    impl::access<type>(*this) += value_of(d);
-    return impl::get<type>(*this);
+    auto& self = static_cast<type&>(*this);
+    value_of(self) += value_of(d);
+    return self;
   }
 
   type&
@@ -641,40 +488,42 @@ public:
     const D& d)
   noexcept(noexcept(std::declval<T&>() -= value_of(d)))
   {
-    impl::access<type>(*this) -= value_of(d);
-    return impl::get<type>(*this);
+    auto& self = static_cast<type&>(*this);
+    value_of(self) -= value_of(d);
+    return self;
   }
 
-  STRONG_NODISCARD
+  [[nodiscard]]
   friend
   type
   operator+(
-    const modifier& lh,
+    const type& lh,
     const D& d)
   {
-    return type(impl::access<type>(lh) + value_of(d));
+    return type(value_of(lh) + impl::access(d));
   }
 
-  STRONG_NODISCARD
+  [[nodiscard]]
   friend
   type
   operator+(
     const D& d,
-    const modifier& rh)
+    const type& rh)
   {
-    return type(value_of(d) + impl::access<type>(rh));
+    return type(impl::access(d) + value_of(rh));
   }
 
-  STRONG_NODISCARD
+  [[nodiscard]]
   friend
   type
   operator-(
-    const modifier& lh,
+    const type& lh,
     const D& d)
   {
-    return type(impl::access<type>(lh) - value_of(d));
+    return type(value_of(lh) - impl::access(d));
   }
 };
+
 
 struct pointer
 {
@@ -687,8 +536,8 @@ class pointer::modifier<::strong::type<T, Tag, M...>>
 {
   using type = strong::type<T, Tag, M...>;
 public:
-  template <typename U = type, typename TT = T>
-  STRONG_NODISCARD
+  template <typename TT = T>
+  [[nodiscard]]
   friend
   constexpr
   auto
@@ -701,58 +550,17 @@ public:
     return value_of(t) == nullptr;
   }
 
-  template <typename U = type, typename TT = T>
-  STRONG_NODISCARD
-  friend
+  [[nodiscard]]
   constexpr
-  auto
-  operator==(
-    std::nullptr_t,
-    const type& t)
-  noexcept(noexcept(nullptr == std::declval<const TT&>()))
-  -> decltype(nullptr == std::declval<const TT&>())
-  {
-    return value_of(t) == nullptr;
-  }
-
-  template <typename U = type, typename TT = T>
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator!=(
-    const type& t,
-    std::nullptr_t)
-  noexcept(noexcept(std::declval<const TT&>() != nullptr))
-  -> decltype(std::declval<const TT&>() != nullptr)
-  {
-    return value_of(t) != nullptr;
-  }
-
-  template <typename U = type, typename TT = T>
-  STRONG_NODISCARD
-  friend
-  constexpr
-  auto
-  operator!=(
-    std::nullptr_t,
-    const type& t)
-  noexcept(noexcept(nullptr != std::declval<const TT&>()))
-  -> decltype(nullptr != std::declval<const TT&>())
-  {
-    return value_of(t) != nullptr;
-  }
-
-  STRONG_NODISCARD
-  constexpr
-  decltype(auto)
+  auto&&
   operator*()
   const
   {
-    return *impl::access<type>(*this);
+    const auto& self = static_cast<const type&>(*this);
+    return *value_of(self);
   }
 
-  constexpr decltype(auto) operator->() const { return &operator*();}
+  constexpr auto* operator->() const { return std::addressof(operator*());}
 };
 
 struct arithmetic
@@ -761,7 +569,7 @@ struct arithmetic
   class modifier
   {
   public:
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -819,7 +627,7 @@ struct arithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -831,7 +639,7 @@ struct arithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -843,7 +651,7 @@ struct arithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -855,7 +663,7 @@ struct arithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -938,7 +746,7 @@ struct bitarithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -950,7 +758,7 @@ struct bitarithmetic
       return T(v);
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -962,7 +770,7 @@ struct bitarithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -974,7 +782,7 @@ struct bitarithmetic
       return lh;
     }
 
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -987,7 +795,7 @@ struct bitarithmetic
     }
 
     template <typename C>
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -1000,7 +808,7 @@ struct bitarithmetic
     }
 
     template <typename C>
-    STRONG_NODISCARD
+    [[nodiscard]]
     friend
     constexpr
     T
@@ -1016,153 +824,183 @@ struct bitarithmetic
 template <typename I = void>
 struct indexed
 {
-  template <typename T>
+  template <typename>
   class modifier;
 };
 
 
-template <>
-template <typename Type>
-class indexed<void>::modifier
-{
-  using ref = typename impl::type_of<Type&>::type;
-  using cref = typename impl::type_of<const Type&>::type;
-  using rref = typename impl::type_of<Type&&>::type;
-public:
-  template <typename I>
-  STRONG_NODISCARD
-  auto
-  operator[](
-    const I& i)
-  const &
-  noexcept(noexcept(std::declval<cref>()[strong::value_of(i)]))
-  -> decltype(std::declval<cref>()[strong::value_of(i)])
-  {
-    return impl::access<Type>(*this)[strong::value_of(i)];
-  }
-
-  template <typename I>
-  STRONG_NODISCARD
-  auto
-  operator[](
-    const I& i)
-  &
-  noexcept(noexcept(std::declval<ref>()[strong::value_of(i)]))
-  -> decltype(std::declval<ref>()[strong::value_of(i)])
-  {
-    return impl::access<Type>(*this)[strong::value_of(i)];
-  }
-
-  template <typename I>
-  STRONG_NODISCARD
-  auto
-  operator[](
-    const I& i)
-  &&
-  noexcept(noexcept(std::declval<rref>()[strong::value_of(i)]))
-  -> decltype(std::declval<rref>()[strong::value_of(i)])
-  {
-    return impl::access<Type>(*this)[strong::value_of(i)];
-  }
-  template <typename I, typename C = cref>
-  STRONG_NODISCARD
-  auto
-  at(
-    const I& i)
-  const &
-  -> decltype(std::declval<C>().at(strong::value_of(i)))
-  {
-    return impl::access<Type>(*this).at(strong::value_of(i));
-  }
-  template <typename I, typename R = ref>
-  STRONG_NODISCARD
-  auto
-  at(
-    const I& i)
-  &
-  -> decltype(std::declval<R>().at(strong::value_of(i)))
-  {
-    return impl::access<Type>(*this).at(strong::value_of(i));
-  }
-  template <typename I, typename R = rref>
-  STRONG_NODISCARD
-  auto
-  at(
-    const I& i)
-  &&
-  -> decltype(std::declval<R>().at(strong::value_of(i)))
-  {
-    return impl::access<Type>(*this).at(strong::value_of(i));
-  }
-};
+template <typename I> template <typename>
+class indexed<I>::modifier {};
 
 template <typename I>
 template <typename T, typename Tag, typename ... M>
-class indexed<I>::modifier<type<T, Tag, M...>>
+class indexed<I>::modifier<::strong::type<T, Tag, M...>>
 {
+  template <typename C, typename II>
+  using at_type = decltype(std::declval<C>().at(std::declval<II>()));
   using type = ::strong::type<T, Tag, M...>;
 public:
-  STRONG_NODISCARD
+  [[nodiscard]]
   auto
   operator[](
     const I& i)
   const &
-  noexcept(noexcept(std::declval<const T&>()[strong::value_of(i)]))
-  -> decltype(std::declval<const T&>()[strong::value_of(i)])
+  noexcept(noexcept(std::declval<const T&>()[impl::access(i)]))
+  -> decltype(std::declval<const T&>()[impl::access(i)])
   {
-    return impl::access<type>(*this)[strong::value_of(i)];
+    auto& self = static_cast<const type&>(*this);
+    return value_of(self)[impl::access(i)];
   }
 
-  STRONG_NODISCARD
+  [[nodiscard]]
   auto
   operator[](
     const I& i)
   &
-  noexcept(noexcept(std::declval<T&>()[strong::value_of(i)]))
-  -> decltype(std::declval<T&>()[strong::value_of(i)])
+  noexcept(noexcept(std::declval<T&>()[impl::access(i)]))
+  -> decltype(std::declval<T&>()[impl::access(i)])
   {
-    return impl::access<type>(*this)[strong::value_of(i)];
+    auto& self = static_cast<type&>(*this);
+    return value_of(self)[impl::access(i)];
   }
 
-  STRONG_NODISCARD
+  [[nodiscard]]
   auto
   operator[](
     const I& i)
   &&
-  noexcept(noexcept(std::declval<T&&>()[strong::value_of(i)]))
-  -> decltype(std::declval<T&&>()[strong::value_of(i)])
+  noexcept(noexcept(std::declval<T&&>()[impl::access(i)]))
+  -> decltype(std::declval<T&&>()[impl::access(i)])
   {
-    return impl::access<type>(*this)[strong::value_of(i)];
+    auto& self = static_cast<type&>(*this);
+    return value_of(std::move(self))[impl::access(i)];
   }
 
-  STRONG_NODISCARD
+  template <typename TT = T>
+  [[nodiscard]]
   auto
   at(
     const I& i)
   const &
-  -> decltype(std::declval<const T&>().at(strong::value_of(i)))
+  -> decltype(std::declval<const TT&>().at(impl::access(i)))
   {
-    return impl::access<type>(*this).at(strong::value_of(i));
+    auto& self = static_cast<const type&>(*this);
+    return value_of(self).at(impl::access(i));
   }
 
-  STRONG_NODISCARD
+  template <typename TT = T>
+  [[nodiscard]]
   auto
   at(
     const I& i)
   &
-  -> decltype(std::declval<T&>().at(strong::value_of(i)))
+  -> decltype(at_access(std::declval<TT&>(), impl::access(i)))
   {
-    return impl::access<type>(*this).at(strong::value_of(i));
+    auto& self = static_cast<type&>(*this);
+    return value_of(self).at(impl::access(i));
   }
 
-  STRONG_NODISCARD
+  template <typename TT = T>
+  [[nodiscard]]
   auto
   at(
     const I& i)
   &&
-  -> decltype(std::declval<T&&>().at(strong::value_of(i)))
+  -> decltype(at_access(std::declval<TT&&>(), impl::access(i)))
   {
-    return impl::access<type>(*this).at(strong::value_of(i));
+    auto& self = static_cast<type&>(*this);
+    return value_of(std::move(self)).at(impl::access(i));
+  }
+};
+
+template <> template <typename V>
+class indexed<void>::modifier {};
+
+template <>
+template <typename T, typename Tag, typename ... Ms>
+class indexed<void>::modifier<::strong::type<T, Tag, Ms...>>
+{
+  static_assert(!std::is_same_v<T, void>);
+  static_assert(!std::is_same_v<T, const void>);
+
+  using type = ::strong::type<T, Tag, Ms...>;
+  using ref = T&;
+  using cref = const T&;
+  using rref = T&&;
+public:
+  template <typename I>
+  [[nodiscard]]
+  auto
+  operator[](
+    const I& i)
+  const &
+  noexcept(noexcept(std::declval<cref>()[impl::access(i)]))
+  -> decltype(std::declval<cref>()[impl::access(i)])
+  {
+    const auto& self = static_cast<const type&>(*this);
+    return value_of(self)[impl::access(i)];
+  }
+
+  template<typename I>
+  [[nodiscard]]
+  auto
+  operator[](
+    const I &i)
+  &
+  noexcept(noexcept(std::declval<ref>()[impl::access(i)]))
+  -> decltype(std::declval<ref>()[impl::access(i)])
+  {
+    auto &self = static_cast<type &>(*this);
+    return value_of(self)[impl::access(i)];
+  }
+
+  template<typename I>
+  [[nodiscard]]
+  auto
+  operator[](
+    const I &i)
+  &&
+  noexcept(noexcept(std::declval<rref>()[impl::access(i)]))
+  -> decltype(std::declval<rref>()[impl::access(i)])
+  {
+    auto &self = static_cast<type &>(*this);
+    return value_of(std::move(self))[impl::access(i)];
+  }
+
+  template<typename I, typename C = cref>
+  [[nodiscard]]
+  auto
+  at(
+    const I &i)
+  const &
+  -> decltype(std::declval<C>().at(impl::access(i)))
+  {
+    auto &self = static_cast<const type &>(*this);
+    return value_of(self).at(impl::access(i));
+  }
+
+  template<typename I, typename R = ref>
+  [[nodiscard]]
+  auto
+  at(
+    const I &i)
+  &
+  -> decltype(std::declval<R>().at(impl::access(i)))
+  {
+    auto &self = static_cast<type &>(*this);
+    return value_of(self).at(impl::access(i));
+  }
+
+  template<typename I, typename R = rref>
+  [[nodiscard]]
+  auto
+  at(
+    const I &i)
+  &&
+  -> decltype(std::declval<R>().at(impl::access(i)))
+  {
+    auto &self = static_cast<type &>(*this);
+    return value_of(std::move(self)).at(impl::access(i));
   }
 };
 
@@ -1200,7 +1038,7 @@ public:
   class modifier;
 };
 
-template <typename T, typename Tag, typename ... M>
+template <std::ranges::range T, typename Tag, typename ... M>
 class range::modifier<type<T, Tag, M...>>
 {
   using type = ::strong::type<T, Tag, M...>;
@@ -1214,14 +1052,16 @@ public:
   begin()
   noexcept(noexcept(std::declval<T&>().begin()))
   {
-    return iterator{impl::access<type>(*this).begin()};
+    auto& self = static_cast<type&>(*this);
+    return iterator{value_of(self).begin()};
   }
 
   iterator
   end()
   noexcept(noexcept(std::declval<T&>().end()))
   {
-    return iterator{impl::access<type>(*this).end()};
+    auto& self = static_cast<type&>(*this);
+    return iterator{value_of(self).end()};
   }
 
   const_iterator
@@ -1229,7 +1069,8 @@ public:
     const
   noexcept(noexcept(std::declval<const T&>().begin()))
   {
-    return const_iterator{impl::access<type>(*this).begin()};
+    auto& self = static_cast<const type&>(*this);
+    return const_iterator{value_of(self).begin()};
   }
 
   const_iterator
@@ -1237,7 +1078,8 @@ public:
     const
   noexcept(noexcept(std::declval<const T&>().end()))
   {
-    return const_iterator{impl::access<type>(*this).end()};
+    auto& self = static_cast<const type&>(*this);
+    return const_iterator{value_of(self).end()};
   }
 
   const_iterator
@@ -1245,7 +1087,8 @@ public:
   const
   noexcept(noexcept(std::declval<const T&>().begin()))
   {
-    return const_iterator{impl::access<type>(*this).begin()};
+    auto& self = static_cast<const type&>(*this);
+    return const_iterator{value_of(self).begin()};
   }
 
   const_iterator
@@ -1253,40 +1096,53 @@ public:
   const
   noexcept(noexcept(std::declval<const T&>().end()))
   {
-    return const_iterator{impl::access<type>(*this).end()};
+    auto& self = static_cast<const type&>(*this);
+    return const_iterator{value_of(self).end()};
   }
 };
+
+namespace impl {
+  template <typename ... Ts>
+  constexpr bool hashable_func(::strong::hashable::modifier<Ts...>*) { return true; }
+
+  constexpr bool hashable_func(...) { return false; }
+
+  template <typename T>
+  concept hashable = hashable_func(static_cast<T*>(nullptr));
+
+  template <typename ... Ts>
+  constexpr bool arithmetic_func(::strong::arithmetic::modifier<Ts...>*) { return true;}
+  constexpr bool arithmetic_func(...) { return false;}
+
+}
 }
 
 namespace std {
 template <typename T, typename Tag, typename ... M>
+requires(strong::impl::hashable<::strong::type<T, Tag, M...>>)
 struct hash<::strong::type<T, Tag, M...>>
-  : std::conditional_t<
-    std::is_base_of<
-      ::strong::hashable::modifier<
-        ::strong::type<T, Tag, M...>
-      >,
-      ::strong::type<T, Tag, M...>
-    >::value,
-    hash<T>,
-    std::false_type>
+    : hash<T>
 {
   using type = ::strong::type<T, Tag, M...>;
   decltype(auto)
   operator()(
-    const ::strong::hashable::modifier<type>& t)
+    const type& t)
   const
   {
-    return hash<T>::operator()(::strong::impl::access<type>(t));
+    return hash<T>::operator()(value_of(t));
   }
 };
+
+
 template <typename T, typename Tag, typename ... M>
 struct is_arithmetic<::strong::type<T, Tag, M...>>
+  : std::bool_constant<strong::impl::arithmetic_func(static_cast<strong::type<T, Tag, M...>*>(nullptr))> {};
+#if 0
   : is_base_of<::strong::arithmetic::modifier<::strong::type<T, Tag, M...>>,
                ::strong::type<T, Tag, M...>>
 {
 };
-
+#endif
 template <typename T, typename Tag, typename ... M>
 struct iterator_traits<::strong::type<T, Tag, M...>>
   : std::iterator_traits<T>
